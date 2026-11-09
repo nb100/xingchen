@@ -1,0 +1,211 @@
+name: Build XingChen APK
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'normal=正式版；noupdate=不检测更新版（跳过一切发布）'
+        required: false
+        default: 'normal'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Generate ThirdPartyKeys from secrets
+        env:
+          PASTEBIN_DEV_KEY: ${{ secrets.THIRDPARTY_PASTEBIN_DEV_KEY }}
+          NETEASE_EAPI_KEY: ${{ secrets.THIRDPARTY_NETEASE_EAPI_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys
+          def java_escape(s):
+              return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+          paste = os.environ.get('PASTEBIN_DEV_KEY')
+          netease = os.environ.get('NETEASE_EAPI_KEY')
+          #if not paste or not netease:
+              #sys.exit('missing third-party secret')
+          path = 'app/src/main/java/com/fongmi/android/tv/api/ThirdPartyKeys.java'
+          content = (
+              'package com.fongmi.android.tv.api;\n\n'
+              'public final class ThirdPartyKeys {\n\n'
+              '    private ThirdPartyKeys() {\n'
+              '    }\n\n'
+              f'    public static final String PASTEBIN_DEV_KEY = "{java_escape(paste)}";\n\n'
+              f'    public static final String NETEASE_EAPI_KEY = "{java_escape(netease)}";\n'
+              '}\n'
+          )
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(content)
+          PYEOF
+      - name: Download mihomo kernel (bundled jniLib)
+        run: |
+          mkdir -p third_party/mihomo/prebuilt/arm64-v8a
+          curl -fL -o /tmp/mihomo.gz "https://xingchen-dl.pages.dev/clash/mihomo-android-arm64-v8-v1.19.33.gz"
+          gzip -dc /tmp/mihomo.gz > third_party/mihomo/prebuilt/arm64-v8a/libmihomo.so
+          echo "cfa0be78846bfef7272fe5a73089f8cf0e1f15a6ffb601f5cc809f457f712f67  third_party/mihomo/prebuilt/arm64-v8a/libmihomo.so" | sha256sum -c -
+          ls -lh third_party/mihomo/prebuilt/arm64-v8a/
+      - name: Download sherpa-onnx.aar (compileOnly)
+        run: |
+          mkdir -p app/libs-compile
+          curl -L -o app/libs-compile/sherpa-onnx.aar "https://raw.githubusercontent.com/XingChenApp/xingchen-asr/main/sherpa-onnx.aar"
+          ls -lh app/libs-compile/
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'jetbrains'
+          java-version: '21.0.3'
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Setup signing
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/xingchen.p12"
+          cat > local.properties <<EOF
+          storeFile=$RUNNER_TEMP/xingchen.p12
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+      - name: Build APK
+        run: |
+          VNAME=$(grep -oP 'versionName\s+"\K[^"]+' app/build.gradle | head -1)
+          echo "WEBHTV_RELEASE_TAG=v$VNAME" >> "$GITHUB_ENV"
+          chmod +x gradlew
+          if [ "${{ inputs.variant }}" = "noupdate" ]; then bash .github/scripts/strip-updater.sh && bash .github/scripts/strip-friend-seed.sh; fi
+          ./gradlew :app:assembleMobileArm64_v8aRelease --no-daemon
+      - name: Find APK
+        run: |
+          find app/build/outputs -name "*.apk" 2>/dev/null | head -20
+          ls -lh app/build/outputs/apk/ 2>/dev/null || echo "No apk folder"
+      - name: Rename friend APK to XingChen version name
+        if: ${{ inputs.variant == 'noupdate' }}
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk -name "*.apk" | head -1)
+          test -n "$APK"
+          VNAME=$(grep -oP 'versionName\s+"\K[^"]+' app/build.gradle | head -1)
+          test -n "$VNAME"
+          DIR=$(dirname "$APK")
+          cp "$APK" "$DIR/星辰$VNAME.apk"
+          rm "$APK"
+          ls -lh "$DIR/"
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XingChen-APK
+          path: app/build/outputs/apk/**/*.apk
+      - name: Collect dist for OCI
+        if: ${{ inputs.variant != 'noupdate' }}
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          APK=$(find app/build/outputs/apk -name "*.apk" | head -1)
+          test -n "$APK"
+          cp "$APK" dist/mobile-arm64_v8a.apk
+          ls -lh dist/
+      - name: Set up ORAS
+        if: ${{ inputs.variant != 'noupdate' }}
+        id: oras
+        continue-on-error: true
+        uses: oras-project/setup-oras@v1
+        with:
+          url: https://github.com/oras-project/oras/releases/download/v1.3.4/oras_1.3.4_linux_amd64.tar.gz
+          checksum: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
+      - name: Publish APK to OCI Registry
+        id: oci
+        if: ${{ inputs.variant != 'noupdate' && steps.oras.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          DIST_DIR: dist
+          OCI_METADATA_FILE: build/oci-metadata.json
+          RELEASE_TAG: ${{ env.WEBHTV_RELEASE_TAG }}
+          OCI_REPOSITORY: xiaosa1996/xingchen-apk
+          OCI_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          OCI_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: bash .github/scripts/publish-oci-apks.sh
+      - name: Report OCI publish failure
+        if: ${{ inputs.variant != 'noupdate' && (steps.oras.outcome == 'failure' || steps.oci.outcome == 'failure') }}
+        run: echo "::warning title=OCI publish unavailable::GitHub release will continue without OCI metadata."
+      - name: Clean old OCI tags (keep only latest)
+        if: ${{ inputs.variant != 'noupdate' && steps.oci.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          KEEP="${WEBHTV_RELEASE_TAG#v}-mobile-arm64_v8a"
+          JWT=$(curl -fsSL -X POST -H "Content-Type: application/json" -d "{\"username\":\"$DH_USER\",\"password\":\"$DH_TOKEN\"}" https://hub.docker.com/v2/users/login/ | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))") || JWT=""
+          if [ -n "$JWT" ]; then
+            curl -fsSL -H "Authorization: JWT $JWT" "https://hub.docker.com/v2/repositories/xiaosa1996/xingchen-apk/tags?page_size=100" | python3 -c "import sys,json; [print(t['name']) for t in json.load(sys.stdin).get('results',[])]" | while read -r t; do
+              if [ "$t" != "$KEEP" ]; then
+                curl -fsSL -X DELETE -H "Authorization: JWT $JWT" "https://hub.docker.com/v2/repositories/xiaosa1996/xingchen-apk/tags/$t/" || true
+              fi
+            done
+          fi
+      - name: Publish release for in-app update
+        if: ${{ inputs.variant != 'noupdate' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OCI_PUBLISH_OUTCOME: ${{ steps.oci.outcome }}
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk -name "*.apk" | head -1)
+          test -n "$APK"
+          GRADLE=$(curl -fsSL "https://raw.githubusercontent.com/XingChenApp/xingchen/batch-20261012/app/build.gradle")
+          VNAME=$(echo "$GRADLE" | grep -oP 'versionName\s+"\K[^"]+' | head -1)
+          VCODE=$(echo "$GRADLE" | grep -oP 'versionCode\s+\K[0-9]+' | head -1)
+          test -n "$VNAME" && test -n "$VCODE"
+          TAG="v$VNAME"
+          ASSET="星辰$VNAME.apk"
+          cp "$APK" "$ASSET"
+          SIZE=$(stat -c%s "$ASSET")
+          SHA=$(sha256sum "$ASSET" | cut -d' ' -f1)
+          # 发布区只留最新一版：先删掉所有旧发布（含草稿）和它们的标签
+          gh api repos/XingChenApp/xingchen/releases --paginate -q '.[].id' | while read -r rid; do
+            gh api -X DELETE "repos/XingChenApp/xingchen/releases/$rid" || true
+          done
+          gh api repos/XingChenApp/xingchen/tags --paginate -q '.[].name' | while read -r t; do
+            case "$t" in v*) gh api -X DELETE "repos/XingChenApp/xingchen/git/refs/tags/$t" || true ;; esac
+          done
+          # 先建新发布并传安装包（标签指向本分支）
+          gh release create "$TAG" --target batch-20261012 --title "星辰 $VNAME" --notes "星辰 $VNAME 更新发布。"
+          gh release upload "$TAG" "$ASSET"
+          # 网站会把资产名里的中文自动去掉，不能按原名找；按 .apk 后缀取回真实存名与直链
+          ASSET_JSON=$(gh api "repos/XingChenApp/xingchen/releases/tags/$TAG" -q '.assets[] | select(.name | endswith(".apk"))')
+          STORED=$(echo "$ASSET_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
+          DL=$(echo "$ASSET_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['browser_download_url'])")
+          test -n "$STORED" && test -n "$DL"
+          python3 - "$VNAME" "$VCODE" "$TAG" "$STORED" "$SIZE" "$SHA" "$DL" <<'PYEOF'
+          import json, os, sys
+          vname, vcode, tag, asset, size, sha, dl = sys.argv[1:8]
+          manifest = {
+              "name": tag,
+              "versionName": vname,
+              "code": int(vcode),
+              "channel": "stable",
+              "apk": asset,
+              "size": int(size),
+              "sha256": sha,
+              "desc": "星辰 " + vname,
+              "notes": "星辰 " + vname + " 更新发布。",
+              "downloads": {"github": {"url": dl}},
+          }
+          # 备用线路：发备用站成功时把描述写进清单（与默影视同款校验：大小与校验值必须对得上）
+          if os.environ.get("OCI_PUBLISH_OUTCOME") == "success" and os.path.isfile("build/oci-metadata.json"):
+              with open("build/oci-metadata.json", encoding="utf-8") as fh:
+                  oci = json.load(fh)
+              descriptor = oci.get("mobile-arm64_v8a")
+              if descriptor is not None:
+                  if descriptor.get("size") != int(size) or descriptor.get("layerDigest") != "sha256:" + sha:
+                      raise SystemExit("OCI descriptor does not match the release APK")
+                  manifest["downloads"]["oci"] = descriptor
+          with open("mobile-arm64_v8a.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+          PYEOF
+          gh release upload "$TAG" mobile-arm64_v8a.json
+          gh release view "$TAG"
