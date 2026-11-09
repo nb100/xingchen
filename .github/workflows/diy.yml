@@ -1,4 +1,4 @@
-name: Build XingChen APK
+name: Build XingChen APK1
 on:
   workflow_dispatch:
     inputs:
@@ -156,7 +156,7 @@ jobs:
           set -euo pipefail
           APK=$(find app/build/outputs/apk -name "*.apk" | head -1)
           test -n "$APK"
-          GRADLE=$(curl -fsSL "https://raw.githubusercontent.com/XingChenApp/xingchen/batch-20261012/app/build.gradle")
+          GRADLE=$(cat app/build.gradle)
           VNAME=$(echo "$GRADLE" | grep -oP 'versionName\s+"\K[^"]+' | head -1)
           VCODE=$(echo "$GRADLE" | grep -oP 'versionCode\s+\K[0-9]+' | head -1)
           test -n "$VNAME" && test -n "$VCODE"
